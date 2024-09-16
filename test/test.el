@@ -311,7 +311,9 @@ strings. STDIN should be a string. If process returns non-zero
 and IGNORE-STATUS is nil, raise `user-error' with STDERR
 message."
   (declare (indent defun))
-  (let* ((args (internal--listify args))
+  (let* ((args (cl-typecase args
+                 (list args)
+                 (otherwise (list args))))
          status)
     (with-temp-buffer
       (when stdin
@@ -383,8 +385,8 @@ FNS should be a list of (FUNCTION-NAME FUNCTION-BODY) lists,
 where FUNCTION-BODY is a lambda form."
   (declare (indent defun))
   `(cl-letf* ,(cl-loop for (fn def) in fns
-                      collect `((symbol-function ',fn)
-                                ,def))
+                       collect `((symbol-function ',fn)
+                                 ,def))
      ,@body))
 
 (defmacro org-super-agenda-test--with-org-today-date (date &rest body)
@@ -401,6 +403,8 @@ where FUNCTION-BODY is a lambda form."
           (groups nil groups-set)
           (span 'day)
           (date org-super-agenda-test-date)
+          (data-file "test/test.org")
+          (skip-lines nil)
           let*)
   "Test BODY with GROUPS and LET* binding.
 When `org-super-agenda-test-save-results' is non-nil, save the
@@ -419,49 +423,58 @@ already loaded."
 
        ;; Redefine functions
        (org-super-agenda-test--with-mock-functions
-         ;; Rebind `format-time-string' so it always returns the
-         ;; same when no time is given, otherwise the "now" line
-         ;; in the time-grid depends on the real time when the
-         ;; test is run.  (For some reason, cl-labels/cl-flet
-         ;; don't work, so we have to use `setf' and
-         ;; `symbol-function'.  Might have something to do with
-         ;; lexical-binding.)
-         ((format-time-string-orig (symbol-function 'format-time-string))
-          (format-time-string (lambda (format-string &optional time zone)
-                                (if time
-                                    (format-time-string-orig format-string time zone)
-                                  (concat (cl-second (s-split " " ,date)) " "))))
-          (frame-width (lambda (&rest _ignore)
+         ((frame-width (lambda (&rest _ignore)
                          134))
           (window-width (lambda (&rest _ignore)
                           134))
           ;; Org after 2017-08-08 uses `window-text-width'
           (window-text-width (lambda (&rest _ignore)
-                               134)))
+                               134))
+          ;; Org after 81a2fe4f0b6d5bb91e96fc91f8550f2dce8d1185 uses `window-max-chars-per-line'.
+          (window-max-chars-per-line (lambda (&rest _ignore) 134)))
 
          ;; Run agenda
          (org-super-agenda-test--with-org-today-date ,date
-           (let* ( ;; Set these vars so they are consistent between my config and the batch config
+           (let* (;; Set these vars so they are consistent between my config and the batch config
                   ,@(org-super-agenda-test--get-custom-group-members 'org-agenda)
                   ,@(org-super-agenda-test--get-custom-group-members 'org-habit)
                   (org-agenda-window-setup 'current-window) ; The default breaks batch tests by trying to open a new frame
                   (org-agenda-start-with-log-mode nil) ; Set this by default, in case it's set to t in my running Emacs instance
+                  (org-agenda-current-time-string "now - - - - - - - - - - - - - - - - - - - - - - - - -")
+                  (org-agenda-block-separator ?=)
                   ;; HACK: Look for test.org in either dir, so it works interactively and
                   ;; in batch tests.  This is ugly, but I don't know how else to do it.
-                  (org-agenda-files (list (if (file-exists-p "test/test.org")
-                                              (expand-file-name "test/test.org")
-                                            (expand-file-name "test.org"))))
+                  (org-agenda-files (list (if (file-exists-p ,data-file)
+                                              (expand-file-name ,data-file)
+                                            (expand-file-name ,data-file))))
                   ,@(if let*
                         let*
-                      `((ignore nil)))
+                      `((_ignore nil)))
                   ,(if groups-set
                        `(org-super-agenda-groups ,groups)
-                     `(ignore nil))
+                     `(_ignore nil))
                   ,(if span
                        `(org-agenda-span ',span)
-                     `(ignore nil))
-                  string)
-             ,body
+                     `(_ignore nil))
+                  _string)
+             ;; Fix org-agenda variables whose value is different on
+             ;; graphical terminals in later Org versions.
+             (setf (nth 2 org-agenda-time-grid) "......"
+                   (nth 3 org-agenda-time-grid) "----------------")
+             (unwind-protect
+                 (progn
+                   ;; Advise `format-time-string' so it always returns the same when no time is given,
+                   ;; otherwise the "now" line in the time-grid depends on the real time when the test
+                   ;; is run.  NOTE: Due to ERT's calling `format-time-string' when a test fails, for
+                   ;; some reason, using `cl-letf*' to rebind `format-time-string' prevents ERT from
+                   ;; using it to log a timestamp, so we use advice here, which seems to work.
+                   (advice-add #'format-time-string :around
+                               (defun org-super-agenda-test/format-time-string (orig-fn format-string &optional time zone)
+                                 (if time
+                                     (funcall orig-fn format-string time zone)
+                                   (concat (cl-second (s-split " " ,date)) " "))))
+                   ,body)
+               (advice-remove #'format-time-string 'org-super-agenda-test/format-time-string))
              ;; We ignore the text properties.  This should be the right thing to do, since we
              ;; never modify them.  It also makes the results actually legible.  NOTE: We
              ;; could collapse the whitespace to avoid annoying discrepancies between my
@@ -469,7 +482,13 @@ already loaded."
              ;; fine, because other than inserting group headers, we're not modifying any
              ;; whitespace.  BUT that means that, when a test fails, we won't be able to
              ;; easily see why, because there won't be any line-breaks for the diff.
-             (setq new-result (buffer-substring-no-properties 1 (point-max)))
+             (setq new-result (buffer-substring-no-properties
+                               (if ,skip-lines
+                                   (save-excursion
+                                     (forward-line ,skip-lines)
+                                     (point))
+                                 1)
+                               (point-max)))
              (unless org-super-agenda-test-show-results
                (kill-buffer)))))
 
@@ -627,6 +646,7 @@ already loaded."
 
 (ert-deftest org-super-agenda-test--someday-tags-view-Emacs ()
   (should (org-super-agenda-test--run
+           :skip-lines 3
            :groups '((:todo "SOMEDAY"))
            :body (org-tags-view nil "Emacs"))))
 
@@ -683,6 +703,7 @@ already loaded."
   ;; DONE: Works.  I don't remember why I have this one using
   ;; `org-todo-list', but I'll leave it.
   (should (org-super-agenda-test--run
+           :skip-lines 4
            :groups '((:deadline nil))
            :body (org-todo-list))))
 (ert-deftest org-super-agenda-test--:deadline-nil-agenda ()
@@ -910,13 +931,14 @@ already loaded."
            :groups '((:not (:todo t))))))
 
 (ert-deftest org-super-agenda-test--with-retained-sorting ()
+  ;; FIXME: This seems to be slightly broken on Org 9.6.6.  Maybe <https://github.com/alphapapa/org-super-agenda/issues/207>?
   (should (org-super-agenda-test--run
            :groups '((:name "Ambitions vs Bills with retained sorting"
                             :and (:todo "TODO" :priority>= "B" :tag "ambition")
                             :and (:todo "TODO" :priority>= "B" :tag "bills")
                             :discard (:anything)))
            :let* ((org-agenda-sorting-strategy '(priority-down tag-down))
-                  (org-super-agenda-retain-sorting t)))))
+                  (org-super-agenda-keep-order t)))))
 
 (ert-deftest org-super-agenda-test--without-retained-sorting ()
   (should (org-super-agenda-test--run
@@ -925,7 +947,7 @@ already loaded."
                             :and (:todo "TODO" :priority>= "B" :tag "bills")
                             :discard (:anything)))
            :let* ((org-agenda-sorting-strategy '(priority-down tag-down))
-                  (org-super-agenda-retain-sorting nil)))))
+                  (org-super-agenda-keep-order nil)))))
 
 (ert-deftest org-super-agenda-test--:order ()
   ;; DONE: Works.
@@ -941,3 +963,14 @@ already loaded."
                                     (:todo "WAITING")
                                     (:name "Not TODOs"
                                            :not (:todo t))))))))
+
+(ert-deftest org-super-agenda-test--issue-264 ()
+  ;; See <https://github.com/alphapapa/org-super-agenda/issues/264>.
+  ;; DONE: Works.
+  (should (org-super-agenda-test--run
+	   :body (org-todo-list)
+           :data-file "test/264.org"
+           :skip-lines 3
+           :groups '((:name "time-grid" :time-grid t)
+                     (:name "Todo" :todo "TODO")
+                     (:name "catch-all" :anything t)))))
